@@ -1,0 +1,270 @@
+name: Comprehensive DevOps GitHub Actions Workflow
+
+on:
+  # Trigger on push to main branch
+  push:
+    branches: [ main ]
+  # Trigger on pull request to main branch  
+  pull_request:
+    branches: [ main ]
+  # Allow manual triggering
+  workflow_dispatch:
+    # Define inputs for manual trigger
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+      skip-tests:
+        description: 'Skip running tests'
+        required: false
+        type: boolean
+
+env:
+  # Global environment variables
+  NODE_VERSION: '18.x'
+  DOCKER_REGISTRY: 'ghcr.io'
+  ARTIFACT_NAME: 'my-app'
+
+jobs:
+  setup-and-validate:
+    name: Setup and Validate
+    runs-on: ubuntu-latest
+    outputs:
+      # Define job outputs that can be used by other jobs
+      node-version: ${{ steps.setup-node.outputs.node-version }}
+      should-deploy: ${{ steps.check-deploy.outputs.should-deploy }}
+      environment: ${{ steps.set-environment.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      id: setup-node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+      # Set output that can be used within workflow
+      env:
+        CUSTOM_ENV: 'setup'
+    
+    - name: Get Node version
+      id: get-version
+      run: |
+        NODE_VERSION=$(node --version)
+        echo "node_version=$NODE_VERSION" >> $GITHUB_OUTPUT
+        echo "Using Node.js version: $NODE_VERSION"
+    
+    - name: Set environment
+      id: set-environment
+      run: |
+        # Using GitHub context and inputs
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        else
+          echo "environment=staging" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Check if deployment should happen
+      id: check-deploy
+      run: |
+        # Complex condition checking
+        if [[ "${{ github.ref }}" == "refs/heads/main" && "${{ github.event_name }}" != "pull_request" ]]; then
+          echo "should-deploy=true" >> $GITHUB_OUTPUT
+        else
+          echo "should-deploy=false" >> $GITHUB_OUTPUT
+        fi
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: setup-and-validate
+    # Conditional job execution
+    if: ${{ !contains(github.event.head_commit.message, '[skip tests]') && (github.event_name != 'workflow_dispatch' || !github.event.inputs.skip-tests) }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ needs.setup-and-validate.outputs.node-version }}
+    
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Run unit tests
+      id: unit-tests
+      run: |
+        npm test
+        echo "tests_passed=true" >> $GITHUB_OUTPUT
+      env:
+        TEST_ENV: 'ci'
+        NODE_ENV: 'test'
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: test-results/
+        retention-days: 30
+
+  docker-build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [setup-and-validate, test]
+    # Using matrix strategy for multiple configurations
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.DOCKER_REGISTRY }}/${{ github.repository }}
+        tags: |
+          type=ref,event=branch
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: ${{ matrix.platform }}
+        push: ${{ needs.setup-and-validate.outputs.should-deploy == 'true' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: setup-and-validate
+    # Continue even if this job fails
+    continue-on-error: true
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Run security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: Upload SARIF results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [setup-and-validate, test, docker-build]
+    # Conditional deployment based on previous job outputs
+    if: ${{ needs.setup-and-validate.outputs.should-deploy == 'true' && needs.test.result == 'success' }}
+    environment: 
+      name: ${{ needs.setup-and-validate.outputs.environment }}
+      url: ${{ steps.deploy.outputs.deployment-url }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deployment step
+      id: deploy
+      run: |
+        # Simulate deployment
+        echo "Deploying to ${{ needs.setup-and-validate.outputs.environment }}"
+        
+        # Set deployment URL output
+        if [ "${{ needs.setup-and-validate.outputs.environment }}" == "production" ]; then
+          echo "deployment-url=https://myapp.com" >> $GITHUB_OUTPUT
+        else
+          echo "deployment-url=https://staging.myapp.com" >> $GITHUB_OUTPUT
+        fi
+        
+        # Simulate deployment commands
+        echo "🚀 Deployment completed successfully!"
+      env:
+        DEPLOY_ENV: ${{ needs.setup-and-validate.outputs.environment }}
+        API_KEY: ${{ secrets.DEPLOYMENT_KEY }}
+    
+    - name: Verify deployment
+      run: |
+        echo "Verifying deployment to ${{ needs.setup-and-validate.outputs.environment }}"
+        # Add health check or smoke tests here
+        sleep 30
+        echo "✅ Deployment verified"
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [setup-and-validate, test, deploy]
+    # Always run this job, even if previous jobs failed
+    if: always()
+    
+    steps:
+    - name: Determine workflow status
+      id: check-status
+      run: |
+        if [ "${{ needs.test.result }}" == "success" ] && [ "${{ needs.deploy.result }}" == "success" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=✅ Workflow completed successfully!" >> $GITHUB_OUTPUT
+        elif [ "${{ needs.test.result }}" == "failure" ]; then
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "message=❌ Tests failed!" >> $GITHUB_OUTPUT
+        elif [ "${{ needs.deploy.result }}" == "failure" ]; then
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "message=❌ Deployment failed!" >> $GITHUB_OUTPUT
+        else
+          echo "status=cancelled" >> $GITHUB_OUTPUT
+          echo "message=⚠️ Workflow was cancelled" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Send Slack notification
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ steps.check-status.outputs.status }}
+        text: ${{ steps.check-status.outputs.message }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Upload workflow artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: workflow-logs
+        path: |
+          ${{ github.workspace }}/logs/
+          ${{ github.workspace }}/reports/
+        retention-days: 7
